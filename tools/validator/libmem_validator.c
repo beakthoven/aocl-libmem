@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <time.h>
 #include <math.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define CACHE_LINE_SZ           64
 #define BOUNDARY_BYTES          8
@@ -35,7 +37,7 @@
 #define YMM_SZ                  32
 #define ZMM_SZ                  64
 #define NULL_TERM_CHAR         '\0'
-#define NULL_STRING            ((uint8_t *)"\0")
+#define NULL_STRING            ""
 #define SINGLE_CHAR_STRING     ((uint8_t *)"A")
 #define MIN_PRINTABLE_ASCII     32
 #define MAX_PRINTABLE_ASCII     126
@@ -51,6 +53,8 @@
 #else
     #define VEC_SZ YMM_SZ
 #endif
+
+#define NO_VECS(size)           (size / VEC_SZ + !!(size % VEC_SZ))
 
 extern void *mempcpy(void *dest, const void *src, size_t n);
 
@@ -85,6 +89,240 @@ typedef struct
 #define implicit_func_decl_pop \
     _Pragma("GCC diagnostic pop") \
 
+/**
+ * @brief Converts a memory page to inaccessible state for Page-cross testing
+ *
+ * This function uses mprotect() to set the specified page to PROT_NONE,
+ * making it inaccessible for read/write operations. This creates a trap
+ * that will cause a segmentation fault if any function attempts to access
+ * memory beyond the intended boundary, helping detect buffer overruns
+ * and other memory access violations in validator functions.
+ *
+ * @param page_buff Pointer to the page-aligned memory buffer
+ * @param page_cnt Number of pages from the start of buffer to the target page
+ * @return 0 on success, -1 on failure (with error message printed)
+ */
+static inline int convert_page_to_inaccessible(void *page_buff, uint32_t page_cnt)
+{
+    if (mprotect((uint8_t *)page_buff + page_cnt * PAGE_SZ, PAGE_SZ, PROT_NONE) != 0)
+    {
+        printf("ERROR:[MPROTECT] Failed to protect page at %p\n", (uint8_t *)page_buff + page_cnt * PAGE_SZ);
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Reverts a memory page back to accessible state before cleanup
+ *
+ * This function uses mprotect() to restore the specified page to PROT_READ|PROT_WRITE,
+ * making it accessible again for normal memory operations. This is essential
+ * before freeing memory that was previously protected, as attempting to free
+ * protected memory can cause segmentation faults due to heap management
+ * operations requiring access to the memory being freed.
+ *
+ * @param page_buff Pointer to the page-aligned memory buffer
+ * @param page_cnt Number of pages from the start of buffer to the target page
+ */
+static inline void revert_page_to_accessible(void *page_buff, uint32_t page_cnt)
+{
+    if (mprotect((uint8_t *)page_buff + page_cnt * PAGE_SZ, PAGE_SZ, PROT_READ|PROT_WRITE) != 0)
+    {
+        printf("ERROR:[MPROTECT] Failed to restore page permissions at %p\n", (uint8_t *)page_buff + page_cnt * PAGE_SZ);
+    }
+}
+
+/**
+ * @brief Determines if a string is a good candidate for page-cross boundary testing
+ *
+ * This function calculates whether a string with given size and alignment
+ * fits within a page after accounting for vector operations, making it
+ * a good candidate for page-cross testing (does not cross last boundary vector).
+ *
+ * @param size Size of the string in bytes
+ * @param alignment Alignment offset of the string
+ * @return 1 if string is a page-cross candidate, 0 otherwise
+ */
+static inline int is_page_cross_candidate(size_t size, uint32_t alignment)
+{
+    size_t no_vecs = NO_VECS(size);
+    size_t offset = (PAGE_SZ - no_vecs * VEC_SZ + alignment);
+    return (offset + size) <= PAGE_SZ;
+}
+
+/**
+ * @brief Allocates and protects a single page buffer for page-cross testing
+ *
+ * @param page_buff Pointer to store the allocated buffer address
+ * @param page_cnt Number of pages to allocate (will add 1 extra for trap)
+ * @param cleanup_buffer Buffer to free on error
+ * @return 0 on success, function exits on failure
+ */
+static inline int alloc_page_cross_buffer(void **page_buff, uint32_t page_cnt, void *cleanup_buffer)
+{
+    if (posix_memalign(page_buff, PAGE_SZ, (page_cnt + 1) * PAGE_SZ) != 0)
+    {
+        printf("[ERROR] Failed to allocate memory for page-cross testing\n");
+        free(cleanup_buffer);
+        exit(-1);
+    }
+    if (convert_page_to_inaccessible(*page_buff, page_cnt) != 0)
+    {
+        free(*page_buff);
+        free(cleanup_buffer);
+        exit(-1);
+    }
+    return 0;
+}
+
+/**
+ * @brief Cleans up page-cross buffer by restoring permissions and freeing memory
+ *
+ * This function restores the page permissions to accessible state and then
+ * frees the page buffer. This consolidates the cleanup pattern used across
+ * all page-cross tests.
+ *
+ * @param page_buff Pointer to the page buffer to clean up
+ * @param page_cnt Number of pages from start to the protected page
+ */
+static inline void cleanup_page_cross_buffer(void *page_buff, uint32_t page_cnt)
+{
+    if (page_buff)
+    {
+        revert_page_to_accessible(page_buff, page_cnt);
+        free(page_buff);
+    }
+}
+
+/**
+ * @brief Cleans up dual page buffers by restoring permissions and freeing memory
+ *
+ * @param page_buff1 First page buffer to clean up (can be NULL)
+ * @param page_buff2 Second page buffer to clean up (can be NULL)
+ * @param page_cnt Number of pages from start to the protected page
+ */
+static inline void cleanup_dual_page_cross_buffers(void *page_buff1, void *page_buff2, uint32_t page_cnt)
+{
+    cleanup_page_cross_buffer(page_buff1, page_cnt);
+    cleanup_page_cross_buffer(page_buff2, page_cnt);
+}
+
+/**
+ * @brief Calculate page-cross string address for different offset patterns
+ *
+ * @param page_buff Base page buffer address
+ * @param page_cnt Page count
+ * @param size String size
+ * @param alignment String alignment
+ * @param use_vector_calc Whether to use vector-based calculation (for strcmp/strncmp)
+ * @return Calculated string address
+ */
+static inline uint8_t* calc_page_cross_address(void *page_buff, uint32_t page_cnt, size_t size,
+                                             uint32_t alignment, int use_vector_calc)
+{
+    if (use_vector_calc)
+    {
+        // For strcmp/strncmp - vector-based calculation
+        return (uint8_t *)page_buff + page_cnt * PAGE_SZ - (VEC_SZ * NO_VECS(size)) + alignment;
+    }
+    else
+    {
+        // For most string functions - basic calculation
+        return (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + alignment);
+    }
+}
+
+/**
+ * @brief Allocate and setup dual page buffers for page-cross testing
+ *
+ * @param str1_addr Pointer to store str1 address (can be NULL if not candidate)
+ * @param str2_addr Pointer to store str2 address (can be NULL if not candidate)
+ * @param str1_align Alignment for str1
+ * @param str2_align Alignment for str2
+ * @param size String size
+ * @param cleanup_buf Buffer to cleanup on error
+ * @param use_vector_calc Whether to use vector-based address calculation
+ * @param page_buff1 Output: allocated page buffer 1 (or NULL)
+ * @param page_buff2 Output: allocated page buffer 2 (or NULL)
+ * @param page_cnt Output: calculated page count
+ * @return 1 if any buffers were allocated, 0 otherwise
+ */
+static inline int setup_dual_page_cross_buffers(uint8_t **str1_addr, uint8_t **str2_addr,
+                                               uint32_t str1_align, uint32_t str2_align,
+                                               size_t size, void *cleanup_buf, int use_vector_calc,
+                                               void **page_buff1, void **page_buff2, uint32_t *page_cnt)
+{
+    int str1_is_candidate = is_page_cross_candidate(size, str1_align);
+    int str2_is_candidate = is_page_cross_candidate(size, str2_align);
+
+    *page_buff1 = NULL;
+    *page_buff2 = NULL;
+    *page_cnt = PAGE_CNT(size);
+
+    if (!(str1_is_candidate || str2_is_candidate))
+        return 0;
+
+    // Allocate str1 buffer if candidate
+    if (str1_is_candidate)
+    {
+        alloc_page_cross_buffer(page_buff1, *page_cnt, cleanup_buf);
+        *str1_addr = calc_page_cross_address(*page_buff1, *page_cnt, size, str1_align, use_vector_calc);
+    }
+
+    // Allocate str2 buffer if candidate
+    if (str2_is_candidate)
+    {
+        if (posix_memalign(page_buff2, PAGE_SZ, (*page_cnt + 1) * PAGE_SZ) != 0)
+        {
+            printf("[ERROR] Failed to allocate memory for str2 page-cross\n");
+            if (*page_buff1)
+                cleanup_page_cross_buffer(*page_buff1, *page_cnt);
+            free(cleanup_buf);
+            exit(-1);
+        }
+        if (convert_page_to_inaccessible(*page_buff2, *page_cnt) != 0)
+        {
+            if (*page_buff1)
+                cleanup_page_cross_buffer(*page_buff1, *page_cnt);
+            free(*page_buff2);
+            free(cleanup_buf);
+            exit(-1);
+        }
+        *str2_addr = calc_page_cross_address(*page_buff2, *page_cnt, size, str2_align, use_vector_calc);
+    }
+
+    return 1;
+}
+
+/**
+ * @brief Setup single page buffer for page-cross testing
+ *
+ * @param str_addr Pointer to store string address
+ * @param str_align String alignment
+ * @param size String size
+ * @param cleanup_buf Buffer to cleanup on error
+ * @param use_vector_calc Whether to use vector-based address calculation
+ * @param page_buff Output: allocated page buffer (or NULL)
+ * @param page_cnt Output: calculated page count
+ * @return 1 if buffer was allocated, 0 otherwise
+ */
+static inline int setup_single_page_cross_buffer(uint8_t **str_addr, uint32_t str_align,
+                                                size_t size, void *cleanup_buf, int use_vector_calc,
+                                                void **page_buff, uint32_t *page_cnt)
+{
+    if (!is_page_cross_candidate(size, str_align))
+    {
+        *page_buff = NULL;
+        return 0;
+    }
+
+    *page_cnt = PAGE_CNT(size);
+    alloc_page_cross_buffer(page_buff, *page_cnt, cleanup_buf);
+    *str_addr = calc_page_cross_address(*page_buff, *page_cnt, size, str_align, use_vector_calc);
+
+    return 1;
+}
+
 typedef uint8_t alloc_mode;
 
 //Function for verifying string functions
@@ -103,6 +341,22 @@ char *test_memchr( const char *src, int ch, size_t len)
         if(src[n] == ch)
             return (void*)&src[n];
     return NULL;
+}
+
+uint8_t *test_memcpy(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    void *val = dst;
+    while(n--)
+        *dst++ = *src++;
+    return val;
+}
+
+int test_memcmp(const uint8_t *s1, const uint8_t *s2, size_t n)
+{
+    for(size_t i = 0; i < n; i++)
+        if(s1[i] != s2[i])
+            return (int)s1[i] - (int)s2[i];
+    return 0;
 }
 
 char *test_strcat_common(char *dst, const char *src, size_t n) {
@@ -125,6 +379,20 @@ char *test_strcat_common(char *dst, const char *src, size_t n) {
         }
         *dst = NULL_TERM_CHAR; // Null-terminate the result
     }
+    return ret;
+}
+
+char *test_strncat(char *dst, const char *src, size_t n) {
+    char *ret = dst;
+    // Find the end of the destination string
+    while (*dst != NULL_TERM_CHAR)
+        dst++;
+    // Concatenate src to the end of dst (strncat behavior)
+    while (n-- && *src != NULL_TERM_CHAR)
+    {
+        *dst++ = *src++;
+    }
+    *dst = NULL_TERM_CHAR; // Null-terminate the result
     return ret;
 }
 
@@ -301,7 +569,7 @@ void string_setup(char *haystack, size_t size, char *needle, size_t needle_len)
     haystack[0] = NULL_TERM_CHAR;
 
     for (size_t i = 0; i < needle_len; i++) {
-        strncat(haystack, needle, i);
+        test_strncat(haystack, needle, i);
     }
 
     uint32_t hay_index = (needle_len - 1)*(needle_len)/2;
@@ -357,7 +625,7 @@ static inline void memcpy_validator(size_t size, uint32_t dst_alnmnt,\
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     dst_alnd_addr = buff_tail + dst_alnmnt;
@@ -415,7 +683,7 @@ static inline void mempcpy_validator(size_t size, uint32_t dst_alnmnt,\
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
 
@@ -477,14 +745,14 @@ static inline void memmove_validator(size_t size, uint32_t dst_alnmnt, uint32_t 
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
 
     validation_buff = alloc_buffer(&temp, &validation_addr, size, DEFAULT);
     if (validation_buff == NULL)
     {
-        perror("Failed to allocate validation buffer\n");
+        printf("[ERROR] Failed to allocate validation buffer\n");
         free(buff);
         exit(-1);
     }
@@ -545,7 +813,7 @@ static inline void memmove_validator(size_t size, uint32_t dst_alnmnt, uint32_t 
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     dst_alnd_addr = buff_tail + dst_alnmnt;
@@ -602,7 +870,7 @@ static inline void memset_validator(size_t size, uint32_t dst_alnmnt,\
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     //Adding offset of CACHE_LINE_SZ to fit in Boundary bytes
@@ -657,7 +925,7 @@ static inline void memcmp_validator(size_t size, uint32_t mem2_alnmnt,\
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
 
@@ -717,14 +985,19 @@ static inline void strcpy_validator(size_t size, uint32_t str2_alnmnt,\
     //special case to handle size ZERO with NULL buff.
     if (size == 0)
     {
-      return ;
+      char dst[]="?";// size 2 dst with ?\0
+      strcpy(dst,(char*)NULL_STRING);
+      if (*dst != NULL_TERM_CHAR)
+         printf("ERROR:[Validation] for size(%lu): expected - %p"\
+                        ", actual - %p\n", size, NULL_STRING, dst);
+      return;
     }
 
     buff = alloc_buffer(&buff_head, &buff_tail, size + BOUNDARY_BYTES, NON_OVERLAP_BUFFER);
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str2_alnd_addr = buff_tail + str2_alnmnt;
@@ -745,8 +1018,8 @@ static inline void strcpy_validator(size_t size, uint32_t str2_alnmnt,\
     for (index = 0; (index < size) && (*(str2_alnd_addr + index) == \
                             *(str1_alnd_addr + index)); index ++);
 
-    if (index != (size))
-        printf("ERROR:[VALIDATION] failed for size: %lu @index:%lu" \
+    if (index != size)
+        printf("ERROR:[VALIDATION] failed for size: %lu @index:%lu " \
                     "[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n", \
               size, index, str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
     else
@@ -778,43 +1051,34 @@ static inline void strcpy_validator(size_t size, uint32_t str2_alnmnt,\
     if (boundary_check(str2_alnd_addr, size))
         printf("[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n",str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
 
-    //Page_check
-    void *page_buff = NULL;
-    uint32_t page_cnt = PAGE_CNT(size);
+    // Robust page-cross check: Only for good candidates (does NOT cross last boundary vector)
+    if (is_page_cross_candidate(size, str1_alnmnt)) {
+        void *page_buff = NULL;
+        uint32_t page_cnt = PAGE_CNT(size);
 
-    posix_memalign(&page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
+        alloc_page_cross_buffer(&page_buff, page_cnt, buff);
 
-    if (page_buff == NULL)
-    {
-        perror("Failed to allocate memory");
-        free(buff);
-        exit(-1);
+        str1_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
+        for (index = 0; index < size; index++) {
+            *(str1_alnd_addr + index) = ((char) 'a' + rand() % LOWER_CHARS);
+        }
+        *(str1_alnd_addr + size - 1) = NULL_TERM_CHAR;
+        ret = strcpy((char *)str2_alnd_addr, (char *)str1_alnd_addr);
+        for (index = 0; (index < size) && (*(str2_alnd_addr + index) == \
+                                *(str1_alnd_addr + index)); index ++);
+        if (index != (size))
+            printf("ERROR:[PAGE-CROSS] validation failed for size: %lu @index:%lu" \
+                        "[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n", \
+                  size, index, str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
+        else
+            ALM_VERBOSE_LOG("Page-cross validation passed for size: %lu\n", size);
+        //validation of return value
+        if (ret != str2_alnd_addr)
+            printf("ERROR:[PAGE-CROSS] Return value mismatch: expected - %p, actual - %p\n", \
+                                                                 str2_alnd_addr, ret);
+
+        cleanup_page_cross_buffer(page_buff, page_cnt);
     }
-
-    str1_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
-
-    for (index = 0; index < size; index++)
-    {
-        *(str1_alnd_addr +index) = ((char) 'a' + rand() % LOWER_CHARS);
-    }
-    *(str1_alnd_addr + size -1) =NULL_TERM_CHAR;
-
-    ret = strcpy((char *)str2_alnd_addr, (char *)str1_alnd_addr);
-
-    for (index = 0; (index < size) && (*(str2_alnd_addr + index) == \
-                            *(str1_alnd_addr + index)); index ++);
-
-    if (index != (size))
-        printf("ERROR:[PAGE-CROSS] validation failed for size: %lu @index:%lu" \
-                    "[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n", \
-              size, index, str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
-    else
-        ALM_VERBOSE_LOG("Page-cross validation passed for size: %lu\n", size);
-    //validation of return value
-    if (ret != str2_alnd_addr)
-        printf("ERROR:[PAGE-CROSS] Return value mismatch: expected - %p, actual - %p\n", \
-                                                             str2_alnd_addr, ret);
-    free(page_buff);
     free(buff);
 }
 
@@ -840,7 +1104,7 @@ static inline void strncpy_validator(size_t size, uint32_t str2_alnmnt,\
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str2_alnd_addr = buff_tail + str2_alnmnt;
@@ -899,11 +1163,9 @@ static inline void strncpy_validator(size_t size, uint32_t str2_alnmnt,\
     if (ret != str2_alnd_addr)
         printf("ERROR:[RETURN] (strlen = n) Return value mismatch: expected - %p, actual - %p\n", \
                                                              str2_alnd_addr, ret);
-
     //Check if the str2 buffer was modified after 'n bytes' copy
     if (boundary_check(str2_alnd_addr, size))
         printf("[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n",str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
-
 
     //CASE 3:validation when str1 length is less than that of 'n'(no.of bytes to be copied)
     //Generating random str1 buffer of size less than n
@@ -949,7 +1211,76 @@ static inline void strncpy_validator(size_t size, uint32_t str2_alnmnt,\
     if (boundary_check(str2_alnd_addr, size))
         printf("[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n",str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
 
+    // Robust page-cross check: Only for good candidates (does NOT cross last boundary vector)
+        void *page_buff;
+        uint32_t page_cnt;
+        if (setup_single_page_cross_buffer(&str1_alnd_addr, str1_alnmnt, size, buff, 0, &page_buff, &page_cnt)) {
+        for (index = 0; index < size; index++) {
+            *(str1_alnd_addr + index) = ((char) 'a' + rand() % LOWER_CHARS);
+        }
 
+        //case1: Null at the size
+        *(str1_alnd_addr + size) = NULL_TERM_CHAR;
+        ret = strncpy((char *)str2_alnd_addr, (char *)str1_alnd_addr, size + VEC_SZ); // intentionally copy more than size bytes
+
+        //validation of return value
+        if (ret != str2_alnd_addr)
+            printf("ERROR:[PAGE-CROSS] (strlen > n) Return value mismatch: expected - %p, actual - %p\n", \
+                                                                 str2_alnd_addr, ret);
+        //Validation of str2 memory
+        if (test_strcmp((char *)str2_alnd_addr, (char *)str1_alnd_addr)) //Validate till NULL
+
+            printf("ERROR:[PAGE-CROSS] (strlen > n) validation failed for size: %lu @index:%lu" \
+                        "[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n", \
+                  size, index, str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
+        else
+                ALM_VERBOSE_LOG("[PAGE-CROSS] (strlen > n) validation passed for size: %lu\n", size);
+
+        //validation of NULL bytes in str2 after str1_len
+        for (index = size + 1; index < size + VEC_SZ; index++)
+        {
+            if (str2_alnd_addr[index] != NULL_TERM_CHAR)
+            {
+                printf("ERROR:[PAGE-CROSS] (strlen > n) NULL Validation failed at index:%lu" \
+                            " for size: %ld(strlen = %ld)\n", index, size, str1_len);
+                break;
+            }
+        }
+        if (index == size + VEC_SZ)
+            ALM_VERBOSE_LOG("[PAGE-CROSS] (strlen > n) NULL Validation passed for size: %lu\n", size);
+
+        //case2: Null exists before size, rand()%VEC_SZ bytes should be NULL
+        null_idx = size - (rand() % VEC_SZ) % size;
+        *(str1_alnd_addr + null_idx) = NULL_TERM_CHAR;
+        ret = strncpy((char *)str2_alnd_addr, (char *)str1_alnd_addr, size + VEC_SZ); // intentionally copy more than size bytes
+
+        //validation of return value
+        if (ret != str2_alnd_addr)
+            printf("ERROR:[PAGE-CROSS] (strlen < n) Return value mismatch: expected - %p, actual - %p\n", \
+                                                                 str2_alnd_addr, ret);
+        //Validation of str2 memory
+        if (test_strcmp((char *)str2_alnd_addr, (char *)str1_alnd_addr)) //Validate till NULL
+
+            printf("ERROR:[PAGE-CROSS] (strlen < n) validation failed for size: %lu @index:%lu" \
+                        "[str1: %p(alignment = %u), str2:%p(alignment = %u)]\n", \
+                  size, index, str1_alnd_addr, str1_alnmnt, str2_alnd_addr, str2_alnmnt);
+        else
+                ALM_VERBOSE_LOG("[PAGE-CROSS] (strlen < n) validation passed for size: %lu\n", size);
+
+        for (index = null_idx + 1; index < size + VEC_SZ; index++)
+        {
+            if (str2_alnd_addr[index] != NULL_TERM_CHAR)
+            {
+                printf("ERROR:[PAGE-CROSS] (strlen < n) NULL Validation failed at index:%lu" \
+                            " for size: %ld(strlen = %ld)\n", index, size, str1_len);
+                break;
+            }
+        }
+        if (index == size + VEC_SZ)
+            ALM_VERBOSE_LOG("[PAGE-CROSS] (strlen < n) NULL Validation passed for size: %lu\n", size);
+
+        cleanup_page_cross_buffer(page_buff, page_cnt);
+    }
     free(buff);
 }
 
@@ -963,21 +1294,23 @@ static inline void strcmp_validator(size_t size, uint32_t str2_alnmnt,\
     int validation1_passed = 1, validation2_passed = 1;
     int exp_ret = 0;
 
-    //special case to handle size ZERO with NULL buff inputs.
+    //special case to handle size ZERO with NULL string inputs.
     if (size == 0)
-    {
-        ret = strcmp((char*)buff, (char*)buff);
+    {   
+        char *src = NULL_STRING;
+        char *dst = NULL_STRING;
+        ret = strcmp(dst, src);
         if (ret != exp_ret)
             printf("ERROR:[RETURN] value mismatch for size(%lu): expected - %d"\
                         ", actual - %d\n", size, exp_ret, ret);
         return;
     }
 
-    buff = alloc_buffer(&buff_head, &buff_tail, size , NON_OVERLAP_BUFFER);
+    buff = alloc_buffer(&buff_head, &buff_tail, size + VEC_SZ, NON_OVERLAP_BUFFER); // + VEC_SZ for extra_size
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str2_alnd_addr = buff_tail + str2_alnmnt;
@@ -985,7 +1318,7 @@ static inline void strcmp_validator(size_t size, uint32_t str2_alnmnt,\
 
     //Case1: Equal strings
     //intialize str1 and str2 memory
-    for (index = 0; index < size; index++)
+    for (index = 0; index < (size -1); index++)
     {
         *(str1_alnd_addr + index) = *(str2_alnd_addr + index) = ((char) 'a' + rand() % LOWER_CHARS);
     }
@@ -1062,110 +1395,76 @@ static inline void strcmp_validator(size_t size, uint32_t str2_alnmnt,\
     }
 
     //case4: strlen(str1), strlen(str2) > size and are matching
-
-    for (index = 0; index < size; index++)
+    size_t extra_size = (rand() % VEC_SZ) + size + 1; //extra_size between [size+1, size+VEC_SZ]
+    for (index = 0; index < extra_size; index++)
     {
         *(str1_alnd_addr + index) = *(str2_alnd_addr + index) = ((char) 'A'+ rand() % LOWER_CHARS);
     }
+    //Appending Null Character at the end of str1 and str2
+    *(str1_alnd_addr + extra_size - NULL_BYTE) = *(str2_alnd_addr + extra_size - NULL_BYTE) = NULL_TERM_CHAR;
 
     ret = strcmp((char *)str1_alnd_addr, (char *)str2_alnd_addr);
     exp_ret = string_cmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, -1);
 
     if (ret!=exp_ret)
     {
-        printf("ERROR:[VALIDATION] (str1(%lu) & str2(%lu) >size) failed for str1_aln:%u str2_aln:%u size: %lu,"\
-                                    " return_value = %d, exp=%d",strlen((char*)str1_alnd_addr),strlen((char*)str2_alnd_addr),str1_alnmnt,str2_alnmnt, size, ret, exp_ret);
+        printf("ERROR:[VALIDATION] (str1(%lu) & str2(%lu) > size) failed for str1_aln:%u str2_aln:%u size: %lu,"\
+                                    " return_value = %d, exp=%d",strlen((char*)str1_alnd_addr),strlen((char*)str2_alnd_addr), str1_alnmnt, str2_alnmnt, size, ret, exp_ret);
     }
 
     //case5: strlen(str1) = size and strlen(str2) > size
 
-    *(str1_alnd_addr + size -1) = NULL_TERM_CHAR;
-    ret = strcmp((char *)str2_alnd_addr, (char *)str1_alnd_addr);
-    exp_ret = (*(uint8_t *)(str2_alnd_addr + size - 1) - \
-                        *(uint8_t *)(str1_alnd_addr + size - 1));
+    *(str1_alnd_addr + size - 1) = NULL_TERM_CHAR;
+
+    ret = strcmp((char *)str1_alnd_addr, (char *)str2_alnd_addr);
+    exp_ret = string_cmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, -1);
     if (ret != exp_ret)
     {
-        printf("ERROR:[VALIDATION] (str1=size, str2(%lu) >size) failed for string @index:%lu str1_aln:%u str2_aln:%u size: %lu,"\
-                                    " return_value = %d\n",strlen((char*)str2_alnd_addr), size-1,str1_alnmnt,str2_alnmnt, size, ret);
+        printf("ERROR:[VALIDATION] (str1=%lu, str2(%lu) >size) failed for string @index:%lu str1_aln:%u str2_aln:%u size: %lu,"\
+                                    " return_value = %d\n", size, strlen((char*)str2_alnd_addr), size-1,str1_alnmnt,str2_alnmnt, size, ret);
     }
 
     //case6:strlen(str2) = size and strlen(str1) > size
+    test_strcpy((char *)str1_alnd_addr, (char *)str2_alnd_addr);
+    *(str2_alnd_addr + size - 1) = NULL_TERM_CHAR;
 
     ret = strcmp((char *)str1_alnd_addr,(char *)str2_alnd_addr);
-    exp_ret = (*(uint8_t *)(str1_alnd_addr + size - 1) - \
-                        *(uint8_t *)(str2_alnd_addr + size - 1));
+    exp_ret = string_cmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, -1);
 
     if (ret != exp_ret)
     {
-        printf("ERROR:[VALIDATION] (str2=size, str1(%lu) >size) failed for string @index:%lu str1_aln:%u str2_aln:%u size: %lu,"\
-                                    " return_value = %d\n",strlen((char*)str2_alnd_addr), size-1,str1_alnmnt,str2_alnmnt, size, ret);
+        printf("ERROR:[VALIDATION] (str2=%lu, str1(%lu) >size) failed for string @index:%lu str1_aln:%u str2_aln:%u size: %lu,"\
+                                    " return_value = %d\n", size, strlen((char*)str2_alnd_addr), size-1,str1_alnmnt,str2_alnmnt, size, ret);
     }
 
-    //Case7: strlen(str1), strlein(str2) < size
-    if (size >=2)
-    {
-        //case7(a): strlen(str1) < strlen(str2)
-        *(str1_alnd_addr + size - 1) = *(str2_alnd_addr + size - 1); //Removing Null from str1
-        size_t s1_sz = rand() % (size / 2 ); //strlen(str1) between [0, size/2 -1]
-        size_t s2_sz = rand() % (size / 2) + size / 2; //strlen(str2) between [size/2 + 1, size-1]
+    // Smart page-cross check: Apply unless NEITHER string is a candidate
+    void *page_buff1 = NULL, *page_buff2 = NULL;
+    uint32_t page_cnt;
 
-        *(str1_alnd_addr + s1_sz) = NULL_TERM_CHAR;
-        *(str2_alnd_addr + s2_sz) = NULL_TERM_CHAR;
+    if (setup_dual_page_cross_buffers(&str1_alnd_addr, &str2_alnd_addr,
+                                     str1_alnmnt, str2_alnmnt, size, buff, 1,
+                                     &page_buff1, &page_buff2, &page_cnt)) {
 
-        ret = strcmp((char *)str2_alnd_addr, (char *)str1_alnd_addr);
-        exp_ret = string_cmp((char *)str2_alnd_addr, (char *)str1_alnd_addr, -1);
-
-        if (ret != exp_ret)
-        {
-           printf("ERROR:[VALIDATION] (str1_sz(%lu) < str2_sz(%lu)) failed for Non-Matching string str1_aln:%u str2_aln:%u,"\
-                                    " return_value = %d, exp_value =%d\n",s1_sz, s2_sz, str1_alnmnt,str2_alnmnt, ret,exp_ret);
+        for (index = 0; index < size; index++) {
+            *(str1_alnd_addr + index) = *(str2_alnd_addr + index) = ((char) 'a' + rand() % LOWER_CHARS);
         }
+        *(str1_alnd_addr + size - 1) = *(str2_alnd_addr + size - 1) = NULL_TERM_CHAR;
 
-        //case7(b): strlen(str1) > strlen(str2)
         ret = strcmp((char *)str1_alnd_addr, (char *)str2_alnd_addr);
-        exp_ret = string_cmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, -1);
-
-        if (ret != exp_ret)
-        {
-           printf("ERROR:[VALIDATION] (str1_sz(%lu) > str2_sz(%lu)) failed for Non-Matching string str1_aln:%u str2_aln:%u size: %lu,"\
-                                    " return_value = %d, exp_value=%d\n",s1_sz, s2_sz, str1_alnmnt,str2_alnmnt, size, ret,exp_ret);
+        if (ret != 0) {
+            printf("ERROR:[PAGE-CROSS] failure for str1_aln:%u str2_aln:%u size: %lu\n", str1_alnmnt, str2_alnmnt, size);
         }
+
+        // Cleanup page buffers
+        cleanup_dual_page_cross_buffers(page_buff1, page_buff2, page_cnt);
     }
-
-    //Page_check
-    void *page_buff = NULL;
-    uint32_t page_cnt = PAGE_CNT(size);
-
-    posix_memalign(&page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
-
-    if (page_buff == NULL)
-    {
-        perror("Failed to allocate memory");
-        free(buff);
-        exit(-1);
-    }
-
-    str1_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
-
-    for (index = 0; index < size; index++)
-    {
-        *(str1_alnd_addr +index) = *(str2_alnd_addr +index) = ((char) 'a' + rand() % LOWER_CHARS);
-    }
-    *(str1_alnd_addr + size -1) = *(str2_alnd_addr + size -1) =NULL_TERM_CHAR;
-
-    ret = strcmp((char *)str2_alnd_addr, (char *)str1_alnd_addr);
-    if (ret != 0 )
-    {
-        printf("ERROR:[PAGE-CROSS] failure for str1_aln:%u size: %lu\n", str1_alnmnt, size);
-    }
-    free(page_buff);
     free(buff);
 }
 
 static inline void strncmp_validator(size_t size, uint32_t str2_alnmnt,\
                                                  uint32_t str1_alnmnt)
 {
-    uint8_t *buff = NULL, *buff_head = SINGLE_CHAR_STRING, *buff_tail = NULL_STRING;
+    uint8_t *buff = NULL, *buff_head = SINGLE_CHAR_STRING, *buff_tail = (uint8_t*)NULL_STRING;
     uint8_t *str2_alnd_addr = NULL, *str1_alnd_addr = NULL;
     size_t index;
     int ret = 0;
@@ -1186,7 +1485,7 @@ static inline void strncmp_validator(size_t size, uint32_t str2_alnmnt,\
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str2_alnd_addr = buff_tail + str2_alnmnt;
@@ -1207,6 +1506,20 @@ static inline void strncmp_validator(size_t size, uint32_t str2_alnmnt,\
         printf("ERROR:[VALIDATION] Matching failure for str1_aln:%u str2_aln:%u size: %lu,"\
                                     " return_value = %d\n",str1_alnmnt,str2_alnmnt, size, ret);
     }
+
+    //passing additional VEC_SZ bytes without NULL, but has mismatching byte after size
+    //to check if function is not going beyond 'size' bytes
+    *(str1_alnd_addr + size - 1) = ((char) 'a' + rand() % LOWER_CHARS);
+    *(str2_alnd_addr + size - 1) = 'X'; //mismatching UPPER case letter
+    ret = strncmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, size + VEC_SZ); // intentionally compare more than size bytes
+    exp_ret = (*(uint8_t *)(str1_alnd_addr + size - 1) - \
+                        *(uint8_t *)(str2_alnd_addr + size - 1));
+    if (ret != exp_ret)
+    {
+        printf("ERROR:[VALIDATION] Matching failure without NULL for str1_aln:%u str2_aln:%u size: %lu,"\
+                                    " return_value = %d exp=%d \n",str1_alnmnt,str2_alnmnt, size, ret, exp_ret);
+    }
+
     else
     {
         ALM_VERBOSE_LOG("Validation passed for matching memory of size: %lu\n", size);
@@ -1219,7 +1532,7 @@ static inline void strncmp_validator(size_t size, uint32_t str2_alnmnt,\
        //Case2(a): s1 < s2
            *(str1_alnd_addr + index) = '$';
 
-       ret = strncmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, size); // -ve value expected
+       ret = strncmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, size + VEC_SZ); // -ve value expected
        exp_ret = (*(uint8_t *)(str1_alnd_addr + index) - \
                         *(uint8_t *)(str2_alnd_addr + index));
 
@@ -1231,7 +1544,7 @@ static inline void strncmp_validator(size_t size, uint32_t str2_alnmnt,\
        }
 
        //Case2(b): s1 > s2
-       ret = strncmp((char *)str2_alnd_addr, (char *)str1_alnd_addr, size); // +ve value expected
+       ret = strncmp((char *)str2_alnd_addr, (char *)str1_alnd_addr, size + VEC_SZ); // +ve value expected
        exp_ret = (*(uint8_t *)(str2_alnd_addr + index) - \
                         *(uint8_t *)(str1_alnd_addr + index));
        if (ret != exp_ret)
@@ -1341,6 +1654,71 @@ static inline void strncmp_validator(size_t size, uint32_t str2_alnmnt,\
                                     " return_value = %d, exp_value=%d\n", s2_sz, s1_sz, str1_alnmnt, str2_alnmnt, size, ret,exp_ret);
         }
     }
+
+    // Smart page-cross check: Apply unless NEITHER string is a candidate
+    void *page_buff1 = NULL, *page_buff2 = NULL;
+    uint32_t page_cnt;
+
+    if (setup_dual_page_cross_buffers(&str1_alnd_addr, &str2_alnd_addr,
+                                     str1_alnmnt, str2_alnmnt, size, buff, 0,
+                                     &page_buff1, &page_buff2, &page_cnt)) {
+
+        // Test case 1: Equal strings
+        for (index = 0; index < size; index++) {
+            *(str1_alnd_addr + index) = *(str2_alnd_addr + index) = ((char) 'a' + rand() % LOWER_CHARS);
+        }
+        *(str1_alnd_addr + size - 1) = *(str2_alnd_addr + size - 1) = NULL_TERM_CHAR;
+
+        ret = strncmp((char *)str2_alnd_addr, (char *)str1_alnd_addr, size + VEC_SZ); //Intentionally using size + VEC_SZ
+        if (ret != 0) {
+            printf("ERROR:[PAGE-CROSS] Equal strings failure for str1_aln:%u str2_aln:%u size: %lu\n", str1_alnmnt, str2_alnmnt, size);
+        } else {
+            ALM_VERBOSE_LOG("[PAGE-CROSS] Equal strings validation passed for size: %lu\n", size);
+        }
+
+        // Test case 2: Different strings (first string smaller)
+        *(str1_alnd_addr + size - 1) = 'a';
+        *(str2_alnd_addr + size - 1) = 'b';
+
+        ret = strncmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, size + VEC_SZ); //Intentionally using size + VEC_SZ
+        exp_ret = (*(uint8_t *)(str1_alnd_addr + size - 1) - *(uint8_t *)(str2_alnd_addr + size - 1));
+        if (ret != exp_ret) {
+            printf("ERROR:[PAGE-CROSS] Different strings (str1<str2) failure for str1_aln:%u str2_aln:%u size: %lu, return_value = %d, expected = %d\n",
+                   str1_alnmnt, str2_alnmnt, size, ret, exp_ret);
+        } else {
+            ALM_VERBOSE_LOG("[PAGE-CROSS] Different strings validation passed for size: %lu\n", size);
+        }
+
+        // Test case 3: Strings shorter than n (null terminator before n bytes)
+        for (index = 0; index < size; index++) {
+            *(str1_alnd_addr + index) = *(str2_alnd_addr + index) = ((char) 'c' + rand() % LOWER_CHARS);
+        }
+
+        *(str1_alnd_addr + size - (rand() % VEC_SZ) % size) = NULL_TERM_CHAR; //Randomly place NULL within last vector
+        *(str2_alnd_addr + size - (rand() % VEC_SZ) % size) = NULL_TERM_CHAR; //Randomly place NULL within last vector
+
+        ret = strncmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, size + VEC_SZ); //Intentionally using size + VEC_SZ
+        if (ret != test_strcmp((char *)str1_alnd_addr, (char *)str2_alnd_addr)) {
+            printf("ERROR:[PAGE-CROSS] Short strings failure for str1_aln:%u str2_aln:%u size: %lu\n", str1_alnmnt, str2_alnmnt, size);
+        } else {
+            ALM_VERBOSE_LOG("[PAGE-CROSS] Short strings validation passed for size: %lu\n", size);
+        }
+
+        //Test case 4: Strings longer than n (no null terminator before n bytes)
+        for (index = 0; index < size; index++) {
+            *(str1_alnd_addr + index) = *(str2_alnd_addr + index) = ((char) 'c' + rand() % LOWER_CHARS);
+        }
+        ret = strncmp((char *)str1_alnd_addr, (char *)str2_alnd_addr, size); //Exact size
+        //Expecting 0 as both strings are equal till size
+        if (ret != 0) {
+            printf("ERROR:[PAGE-CROSS] Long strings failure for str1_aln:%u str2_aln:%u size: %lu\n", str1_alnmnt, str2_alnmnt, size);
+        } else {
+            ALM_VERBOSE_LOG("[PAGE-CROSS] Long strings validation passed for size: %lu\n", size);
+        }
+
+        // Cleanup page buffers
+        cleanup_dual_page_cross_buffers(page_buff1, page_buff2, page_cnt);
+    }
     free(buff);
 }
 
@@ -1356,7 +1734,7 @@ static inline void strlen_validator(size_t size, uint32_t str2_alnmnt __attribut
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
 
@@ -1383,33 +1761,23 @@ static inline void strlen_validator(size_t size, uint32_t str2_alnmnt __attribut
         ALM_VERBOSE_LOG("Validation passed for strlen: %lu\n", size);
     }
 
-    //Page_check
-    void *page_buff = NULL;
-    uint32_t page_cnt = PAGE_CNT(size);
-    posix_memalign(&page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
+    // Robust page-cross check: Only if string does NOT cross last boundary vector
+    // This identifies good candidates for page-cross testing
+    void *page_buff;
+    uint32_t page_cnt;
 
-    if (page_buff == NULL)
-    {
-        perror("Failed to allocate memory");
-        free(buff);
-        exit(-1);
+    if (setup_single_page_cross_buffer(&str_alnd_addr, str1_alnmnt, size, buff, 0, &page_buff, &page_cnt)) {
+        for (index = 0; index < size; index++) {
+            *(str_alnd_addr + index) = ((char) 'a' + rand() % LOWER_CHARS);
+        }
+        *(str_alnd_addr + size) = NULL_TERM_CHAR;
+        ret = strlen((char *)str_alnd_addr);
+        if (ret != size) {
+            printf("ERROR:[PAGE-CROSS] failure for str1_aln:%u size: %lu\n", str1_alnmnt, size);
+        }
+
+        cleanup_page_cross_buffer(page_buff, page_cnt);
     }
-
-    str_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
-
-    for (index = 0; index < size; index++)
-    {
-        *(str_alnd_addr +index) = ((char) 'a' + rand() % LOWER_CHARS);
-    }
-    *(str_alnd_addr + size) =NULL_TERM_CHAR;
-
-    ret = strlen((char *)str_alnd_addr);
-    if (ret != size )
-    {
-        printf("ERROR:[PAGE-CROSS] failure for str1_aln:%u size: %lu\n", str1_alnmnt, size);
-    }
-
-    free(page_buff);
     free(buff);
 }
 
@@ -1424,7 +1792,7 @@ static inline void memchr_validator(size_t size, uint32_t str2_alnmnt __attribut
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str_alnd_addr = buff_tail + str1_alnmnt;
@@ -1488,15 +1856,26 @@ static inline void strcat_validator(size_t size, uint32_t str2_alnmnt,\
     size_t index;
     char *ret = NULL;
 
-    if(size == 0) //For Null expected behaviour is SEGFAULT
+    if(size == 0) //src is null string with extra bytes
     {
+        uint8_t src[] = {NULL_TERM_CHAR,'?','?'};
+        uint8_t dst[] = {'!',NULL_TERM_CHAR,'!','!'};
+        uint8_t dst_before[sizeof(dst)];
+        test_memcpy(dst_before, dst,sizeof(dst));
+        strcat((char*)dst, (char*)src);
+        if (test_memcmp(dst_before,dst,sizeof(dst)) != 0)
+        {
+           printf("ERROR:[VALIDATION] failure for size(%lu): dst buffer modified \n", size);
+
+        }
+
         return;
     }
     str1_buff = alloc_buffer(&buff_head, &buff_tail,2 * size + NULL_BYTE, DEFAULT);
     // String size big enough to accommodate str2
     if (str1_buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str1_alnd_addr = (char *)buff_tail + str1_alnmnt;
@@ -1504,7 +1883,7 @@ static inline void strcat_validator(size_t size, uint32_t str2_alnmnt,\
     if (str2_buff == NULL)
     {
         free(str1_buff);
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str2_alnd_addr = (char *)buff_tail + str2_alnmnt;
@@ -1523,7 +1902,7 @@ static inline void strcat_validator(size_t size, uint32_t str2_alnmnt,\
 
     if (temp_buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         free(str1_buff);
         free(str2_buff);
         exit(-1);
@@ -1562,62 +1941,43 @@ static inline void strcat_validator(size_t size, uint32_t str2_alnmnt,\
     }
 
     free(str2_buff);
-    //Page_check
-    if (size <= PAGE_SZ)
-    {
+    // Robust page-cross check: Only for good candidates (does NOT cross last boundary vector)
+    if (is_page_cross_candidate(size, str2_alnmnt)) {
         void *str2_page_buff = NULL;
         uint32_t page_cnt = PAGE_CNT(2 * size);
 
-        posix_memalign(&str2_page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
-        if (str2_page_buff == NULL)
-        {
-            perror("Failed to allocate memory");
-            free(str1_buff);
-            free(temp_buff);
-            exit(-1);
-        }
+        alloc_page_cross_buffer(&str2_page_buff, page_cnt, str1_buff);
 
-        // str1_alnd_addr = (uint8_t *)str1_buff + page_cnt * PAGE_SZ - (2 * size + NULL_BYTE + str1_alnmnt);
         str2_alnd_addr = (char *)str2_page_buff + page_cnt* PAGE_SZ - (size + NULL_BYTE + str2_alnmnt);
-
-        for (index = 0; index < size; index++)
-        {
+        for (index = 0; index < size; index++) {
             *(str1_alnd_addr +index) = ((char) 'a' + rand() % LOWER_CHARS);
             *(str2_alnd_addr +index) = ((char) 'a' + rand() % LOWER_CHARS);
         }
         *(str1_alnd_addr + size -1) = *(str2_alnd_addr + (rand()%size)) = NULL_TERM_CHAR;
-
         test_strcpy((char *)tmp_alnd_addr, (char *)str1_alnd_addr);
         ret = strcat((char *)str1_alnd_addr, (char *)str2_alnd_addr);
-
-        if(test_strcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str2_alnd_addr, SIZE_MIN), (char *)str1_alnd_addr) != 0)
-        {
+        if(test_strcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str2_alnd_addr, SIZE_MIN), (char *)str1_alnd_addr) != 0) {
             printf("ERROR: [PAGE-CROSS] failed\n str1:%s\n str2:%s\n str1+str2:%s\n",tmp_alnd_addr, str2_alnd_addr,str1_alnd_addr);
         }
-        if (ret != str1_alnd_addr)
-        {
+        if (ret != str1_alnd_addr) {
             printf("ERROR:[VALIDATION] failure for size: %lu,"\
                     " return_value = %p, expected_value= %p\n", size, ret, str1_alnd_addr);
         }
-
         //Page_check with Multi-NULL
         more_null_idx = rand() % size;
         *(tmp_alnd_addr + more_null_idx) = NULL_TERM_CHAR;
         test_strcpy((char *)str1_alnd_addr, (char *)tmp_alnd_addr);
-
         *(str2_alnd_addr + more_null_idx) = NULL_TERM_CHAR;
         ret = strcat((char *)str1_alnd_addr, (char *)str2_alnd_addr);
-
-        if(test_strcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str2_alnd_addr, SIZE_MIN),(char *)str1_alnd_addr) != 0)
-        {
+        if(test_strcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str2_alnd_addr, SIZE_MIN),(char *)str1_alnd_addr) != 0) {
             printf("ERROR: [PAGE-CROSS] MultiNull check failed\n str1:%s\n str2:%s\n str1+str2:%s\n",tmp_alnd_addr, str2_alnd_addr,str1_alnd_addr);
         }
-        if (ret != str1_alnd_addr)
-        {
+        if (ret != str1_alnd_addr) {
             printf("ERROR:[VALIDATION] failure for size: %lu,"\
                     " return_value = %p, expected_value= %p\n", size, ret, str1_alnd_addr);
         }
-        free(str2_page_buff);
+
+        cleanup_page_cross_buffer(str2_page_buff, page_cnt);
     }
     free(temp_buff);
     free(str1_buff);
@@ -1639,7 +1999,7 @@ static inline void strncat_validator(size_t size, uint32_t str2_alnmnt,\
     // String size big enough to accommodate str2
     if (str1_buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str1_alnd_addr = (char *)buff_tail + str1_alnmnt;
@@ -1647,7 +2007,7 @@ static inline void strncat_validator(size_t size, uint32_t str2_alnmnt,\
     if (str2_buff == NULL)
     {
         free(str1_buff);
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     str2_alnd_addr = (char *)buff_tail + str2_alnmnt;
@@ -1666,7 +2026,7 @@ static inline void strncat_validator(size_t size, uint32_t str2_alnmnt,\
 
     if (temp_buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         free(str1_buff);
         free(str2_buff);
         exit(-1);
@@ -1705,60 +2065,55 @@ static inline void strncat_validator(size_t size, uint32_t str2_alnmnt,\
                 " return_value = %p, expected_value= %p\n", size, ret, str1_alnd_addr);
     }
 
-    //Page_check
-    if (size <= PAGE_SZ)
-    {
+    // Robust page-cross check: Only for good candidates (does NOT cross last boundary vector)
+    if (is_page_cross_candidate(size, str2_alnmnt)) {
         void *str2_page_buff = NULL;
         uint32_t page_cnt = PAGE_CNT(2 * size);
 
-        posix_memalign(&str2_page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
-        if (str2_page_buff == NULL)
-        {
-            perror("Failed to allocate memory");
-            free(str1_buff);
+        // Need to handle cleanup of temp_buff and str1_buff - use a compound cleanup approach
+        if (posix_memalign(&str2_page_buff, PAGE_SZ, (page_cnt + 1) * PAGE_SZ) != 0) {
+            printf("[ERROR] Failed to allocate memory for page-cross testing\n");
             free(temp_buff);
+            free(str1_buff);
+            free(str2_buff);
+            exit(-1);
+        }
+        if (convert_page_to_inaccessible(str2_page_buff, page_cnt) != 0) {
+            free(str2_page_buff);
+            free(temp_buff);
+            free(str1_buff);
+            free(str2_buff);
             exit(-1);
         }
 
         str3_alnd_addr = (char *)str2_page_buff + page_cnt* PAGE_SZ - (size + NULL_BYTE + str2_alnmnt);
-
         test_strcpy(str1_alnd_addr, tmp_alnd_addr);
         test_strcpy(str3_alnd_addr, str2_alnd_addr);
-
         more_null_idx = rand()%size;
         *(str1_alnd_addr + size -1) = *(str3_alnd_addr + more_null_idx) =*(tmp_alnd_addr + size -1) = *(str2_alnd_addr + more_null_idx) = NULL_TERM_CHAR;
-
-
         test_strcpy((char *)tmp_alnd_addr, (char *)str1_alnd_addr);
         ret = strncat((char *)str1_alnd_addr, (char *)str3_alnd_addr, size);
-
-        if (memcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str3_alnd_addr, size), (char *)str1_alnd_addr, size) != 0)
-        {
+        if (memcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str3_alnd_addr, size), (char *)str1_alnd_addr, size) != 0) {
             printf("ERROR: [PAGE-CROSS] failed for size:%zu\n str1:%s\n str2:%s\n str1+str2:%s\n", size, tmp_alnd_addr, str3_alnd_addr,str1_alnd_addr);
         }
-        if (ret != str1_alnd_addr)
-        {
+        if (ret != str1_alnd_addr) {
             printf("ERROR:[VALIDATION] failure for size: %lu,"\
                     " return_value = %p, expected_value= %p\n", size, ret, str1_alnd_addr);
         }
-
         //Page_check with Multi-NULL
         more_null_idx = rand() % size;
         *(str1_alnd_addr + size -1) = *(str3_alnd_addr + more_null_idx) = *(tmp_alnd_addr + size -1) = NULL_TERM_CHAR;
-
         test_strcpy((char *)str1_alnd_addr, (char *)tmp_alnd_addr);
         ret = strncat((char *)str1_alnd_addr, (char *)str3_alnd_addr, size);
-
-        if(memcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str3_alnd_addr, size),(char *)str1_alnd_addr, size) != 0)
-        {
+        if(memcmp(test_strcat_common((char *)tmp_alnd_addr, (char *)str3_alnd_addr, size),(char *)str1_alnd_addr, size) != 0) {
             printf("ERROR: [PAGE-CROSS] MultiNull check failed for size:%zu\n str1:%s\n str2:%s\n str1+str2:%s\n", size, tmp_alnd_addr, str3_alnd_addr,str1_alnd_addr);
         }
-        if (ret != str1_alnd_addr)
-        {
+        if (ret != str1_alnd_addr) {
             printf("ERROR:[VALIDATION] failure for size: %lu,"\
                     " return_value = %p, expected_value= %p\n", size, ret, str1_alnd_addr);
         }
-        free(str2_page_buff);
+
+        cleanup_page_cross_buffer(str2_page_buff, page_cnt);
     }
     free(temp_buff);
     free(str1_buff);
@@ -1769,7 +2124,7 @@ static inline void strstr_validator(size_t size, uint32_t str2_alnmnt,\
                                                  uint32_t str1_alnmnt)
 {
     uint8_t *buff = NULL, *buff_head, *buff_tail;
-    uint8_t *haystack = SINGLE_CHAR_STRING, *needle = NULL_STRING, *page_alnd_addr = NULL;
+    uint8_t *haystack = SINGLE_CHAR_STRING, *needle = (uint8_t*)NULL_STRING;
     char *res;
     size_t needle_len = 0;
 
@@ -1792,7 +2147,7 @@ static inline void strstr_validator(size_t size, uint32_t str2_alnmnt,\
     buff = alloc_buffer(&buff_head, &buff_tail, size + NULL_BYTE, NON_OVERLAP_BUFFER);
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     haystack = buff_tail + str1_alnmnt;
@@ -1847,45 +2202,75 @@ static inline void strstr_validator(size_t size, uint32_t str2_alnmnt,\
         str1_alnmnt, needle_len, res, res, haystack, haystack, needle, needle);
     }
 
-    //case5: PageCross_check for size <= 4KB
-    if  (size <= PAGE_SZ)
+    // Smart page-cross check: Apply to haystack and/or needle if they are candidates
+    int haystack_is_candidate = is_page_cross_candidate(size, str1_alnmnt);
+    int needle_is_candidate = is_page_cross_candidate(needle_len, str2_alnmnt);
+
+    if (haystack_is_candidate || needle_is_candidate)
     {
+        void *haystack_page_buff = NULL, *needle_page_buff = NULL;
+        uint32_t haystack_page_cnt = 0, needle_page_cnt = 0;
+        uint8_t *page_haystack = haystack, *page_needle = needle;
 
-        void *page_buff = NULL;
-        uint32_t page_cnt = PAGE_CNT(size);
-        posix_memalign(&page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
-
-        if (page_buff == NULL)
+        // Setup haystack page buffer if it's a candidate
+        if (haystack_is_candidate)
         {
-            perror("Failed to allocate memory");
-            free(buff);
-            exit(-1);
+            haystack_page_cnt = PAGE_CNT(size);
+            alloc_page_cross_buffer(&haystack_page_buff, haystack_page_cnt, buff);
+            page_haystack = (uint8_t *)haystack_page_buff + haystack_page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
         }
 
-        page_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
-
-        string_setup((char *)page_alnd_addr, size, (char *)needle, needle_len);
-
-        res = strstr((char*)page_alnd_addr, (char*) needle);
-        if (res != test_strstr((char*)page_alnd_addr, (char*)needle))
+        // Setup needle page buffer if it's a candidate
+        if (needle_is_candidate)
         {
-            printf("ERROR:[VALIDATION:PAGE-CROSS] failure for missing needle of \
-            str1_aln:%u size:%lu,\nreturn_value(%p):%s\nNEEDLE(%p):%s\nHAYSTACK(%p):%s\n",\
-            str1_alnmnt, size, res, res, needle, needle, page_alnd_addr, page_alnd_addr);
+            needle_page_cnt = PAGE_CNT(needle_len);
+            if (posix_memalign(&needle_page_buff, PAGE_SZ, (needle_page_cnt + 1) * PAGE_SZ) != 0)
+            {
+                printf("[ERROR] Failed to allocate needle page buffer\n");
+                if (haystack_page_buff)
+                    cleanup_page_cross_buffer(haystack_page_buff, haystack_page_cnt);
+                free(buff);
+                exit(-1);
+            }
+            if (convert_page_to_inaccessible(needle_page_buff, needle_page_cnt) != 0)
+            {
+                free(needle_page_buff);
+                if (haystack_page_buff)
+                    cleanup_page_cross_buffer(haystack_page_buff, haystack_page_cnt);
+                free(buff);
+                exit(-1);
+            }
+            page_needle = (uint8_t *)needle_page_buff + needle_page_cnt * PAGE_SZ - (needle_len + NULL_BYTE + str2_alnmnt);
+            // Copy original needle content to page buffer and ensure NULL termination
+            test_strcpy((char*)page_needle, (char*)needle);
         }
 
-        //Adding Needle at the end of haysatck
-        page_alnd_addr[size - needle_len] = NULL_TERM_CHAR;
-        strncat((char*)page_alnd_addr, (char*)needle, needle_len);
-
-        res = strstr((char*)page_alnd_addr, (char*) needle);
-        if (res != test_strstr((char*)page_alnd_addr, (char*)needle))
+        // Test case 1: Haystack = substrings(needle) without the needle
+        string_setup((char *)page_haystack, size, (char *)page_needle, needle_len);
+        res = strstr((char*)page_haystack, (char*)page_needle);
+        if (res != test_strstr((char*)page_haystack, (char*)page_needle))
         {
-            printf("ERROR:[VALIDATION:PAGE-CROSS]failure with Needle at the end \
-            str1_aln:%u size:%lu,\nreturn_value(%p):%s\nNEEDLE(%p):%s\nHAYSTACK(%p):%s\n",\
-            str1_alnmnt, size, res, res, needle, needle, page_alnd_addr, page_alnd_addr);
+            printf("ERROR:[PAGE-CROSS:HAYSTACK = substrings(Needle)] failure for \
+            str1_aln:%u str2_aln:%u size:%lu,\nreturn_value(%p):%s\nNEEDLE(%p):%s\nHAYSTACK(%p):%s\n",\
+            str1_alnmnt, str2_alnmnt, size, res, res, page_needle, page_needle, page_haystack, page_haystack);
         }
-        free(page_buff);
+
+        //Test case 2: Adding needle at the end of haystack
+        page_haystack[size - needle_len] = NULL_TERM_CHAR;
+        strncat((char*)page_haystack, (char*)page_needle, needle_len);
+        res = strstr((char*)page_haystack, (char*)page_needle);
+        if (res != test_strstr((char*)page_haystack, (char*)page_needle))
+        {
+            printf("ERROR:[PAGE-CROSS:Needle at the end] failure for \
+            str1_aln:%u str2_aln:%u size:%lu,\nreturn_value(%p):%s\nNEEDLE(%p):%s\nHAYSTACK(%p):%s\n",\
+            str1_alnmnt, str2_alnmnt, size, res, res, page_needle, page_needle, page_haystack, page_haystack);
+        }
+
+        // Cleanup buffers
+        if (haystack_page_buff)
+            cleanup_page_cross_buffer(haystack_page_buff, haystack_page_cnt);
+        if (needle_page_buff)
+            cleanup_page_cross_buffer(needle_page_buff, needle_page_cnt);
     }
     free(buff);
 }
@@ -1894,7 +2279,7 @@ static inline void strspn_validator(size_t size, uint32_t str2_alnmnt,\
                                                  uint32_t str1_alnmnt)
 {
     uint8_t *buff = NULL, *buff_head, *buff_tail;
-    uint8_t *s = SINGLE_CHAR_STRING, *accept = NULL_STRING, *page_alnd_addr = NULL;
+    uint8_t *s = SINGLE_CHAR_STRING, *accept = (uint8_t*)NULL_STRING, *page_alnd_addr = NULL;
     size_t res, expected;
     size_t accept_len = 0;
 
@@ -1919,7 +2304,7 @@ static inline void strspn_validator(size_t size, uint32_t str2_alnmnt,\
     buff = alloc_buffer(&buff_head, &buff_tail, size + NULL_BYTE, NON_OVERLAP_BUFFER);
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
     s = buff_tail + str1_alnmnt;
@@ -1988,7 +2373,7 @@ static inline void strspn_validator(size_t size, uint32_t str2_alnmnt,\
 
         if (page_buff == NULL)
         {
-            perror("Failed to allocate memory");
+            printf("[ERROR] Failed to allocate memory\n");
             free(buff);
             exit(-1);
         }
@@ -2037,7 +2422,7 @@ static inline void strchr_validator(size_t size, uint32_t str2_alnmnt __attribut
 
     if (buff == NULL)
     {
-        perror("Failed to allocate memory");
+        printf("[ERROR] Failed to allocate memory\n");
         exit(-1);
     }
 
@@ -2117,78 +2502,58 @@ static inline void strchr_validator(size_t size, uint32_t str2_alnmnt __attribut
                     test_strchr((char*)str_alnd_addr,(int)find));
     }
 
-    //Page_check
-    void *page_buff = NULL;
-    uint32_t page_cnt = PAGE_CNT(size);
-    posix_memalign(&page_buff, PAGE_SZ, page_cnt * PAGE_SZ);
+    // Robust page-cross check: Only for good candidates
+    if (is_page_cross_candidate(size, str1_alnmnt)) {
+        void *page_buff = NULL;
+        uint32_t page_cnt = PAGE_CNT(size);
 
-    if (page_buff == NULL)
-    {
-        perror("Failed to allocate memory");
-        free(buff);
-        exit(-1);
-    }
+        alloc_page_cross_buffer(&page_buff, page_cnt, buff);
 
-    str_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
-
-    for (index = 0; index < size; index++)
-    {
-        *(str_alnd_addr + index) = random_char();
-    }
-    *(str_alnd_addr + size ) = NULL_TERM_CHAR;
-
-    if (size == 1)
-        find = *(str_alnd_addr);
-    else
-        find =  str_alnd_addr[rand() % (size - 1)];
-
-    res = strchr((char*)str_alnd_addr,(int)find);
-
-    if ((test_strchr((char*)str_alnd_addr,(int)find)) != (char*)res)
-    {
-        printf("ERROR:[PAGE-CROSS (MATCH)] failure for str1_aln:%u size: %lu,"\
-                " return_value = %s, EXP= %s\n",str1_alnmnt, size, res, \
-                test_strchr((char*)str_alnd_addr,(int)find));
-    }
-
-    if (size == 1)
-        find = *(str_alnd_addr);
-    else
-        find =  str_alnd_addr[rand() % (size - 1)];
-    for (index = 0; index < size; index++)
-    {
-        if (*(str_alnd_addr + index) == find)
-        {
-            do
-            {
-                not_found = random_char();
-            } while (find == not_found);
-            *(str_alnd_addr + index) = not_found;
+        str_alnd_addr = (uint8_t *)page_buff + page_cnt * PAGE_SZ - (size + NULL_BYTE + str1_alnmnt);
+        for (index = 0; index < size; index++) {
+            *(str_alnd_addr + index) = random_char();
         }
-    }
-
-    res = strchr((char*)str_alnd_addr,(int)find);
-    if(res != NULL)
-    {
-        printf("ERROR:[PAGE-CROSS (NON-MATCH)] failure for str1_aln:%u size: %lu,"\
-                                    " return_value = %s, EXP= NULL\n",str1_alnmnt, size, res);
-    }
-
-    if (size == 1)
-        find = *(str_alnd_addr);
-    else
-        *(str_alnd_addr + size - NULL_BYTE - 1) = find;
-
-    res = strchr((char*)str_alnd_addr,(int)find);
-
-    if(test_strchr((char*)str_alnd_addr,(int)find) != (char*)res)
-    {
-        printf("ERROR:[PAGE-CROSS (MATCH:END)] failure for str1_aln:%u size: %lu,"\
+        *(str_alnd_addr + size ) = NULL_TERM_CHAR;
+        if (size == 1)
+            find = *(str_alnd_addr);
+        else
+            find =  str_alnd_addr[rand() % (size - 1)];
+        res = strchr((char*)str_alnd_addr,(int)find);
+        if ((test_strchr((char*)str_alnd_addr,(int)find)) != (char*)res) {
+            printf("ERROR:[PAGE-CROSS (MATCH)] failure for str1_aln:%u size: %lu,"\
                     " return_value = %s, EXP= %s\n",str1_alnmnt, size, res, \
                     test_strchr((char*)str_alnd_addr,(int)find));
-    }
+        }
+        if (size == 1)
+            find = *(str_alnd_addr);
+        else
+            find =  str_alnd_addr[rand() % (size - 1)];
+        for (index = 0; index < size; index++) {
+            if (*(str_alnd_addr + index) == find) {
+                do {
+                    not_found = random_char();
+                } while (find == not_found);
+                *(str_alnd_addr + index) = not_found;
+            }
+        }
+        res = strchr((char*)str_alnd_addr,(int)find);
+        if(res != NULL) {
+            printf("ERROR:[PAGE-CROSS (NON-MATCH)] failure for str1_aln:%u size: %lu,"\
+                                        " return_value = %s, EXP= NULL\n",str1_alnmnt, size, res);
+        }
+        if (size == 1)
+            find = *(str_alnd_addr);
+        else
+            *(str_alnd_addr + size - NULL_BYTE - 1) = find;
+        res = strchr((char*)str_alnd_addr,(int)find);
+        if(test_strchr((char*)str_alnd_addr,(int)find) != (char*)res) {
+            printf("ERROR:[PAGE-CROSS (MATCH:END)] failure for str1_aln:%u size: %lu,"\
+                        " return_value = %s, EXP= %s\n",str1_alnmnt, size, res, \
+                        test_strchr((char*)str_alnd_addr,(int)find));
+        }
 
-    free(page_buff);
+        cleanup_page_cross_buffer(page_buff, page_cnt);
+    }
     free(buff);
 }
 
@@ -2238,9 +2603,9 @@ int main(int argc, char **argv)
         }
     }
 
-    for (uint16_t index = 0; index <= (uint16_t)(sizeof(supp_funcs)/sizeof(supp_funcs[0])); index++)
+    for (uint16_t index = 0; index < (uint16_t)(sizeof(supp_funcs)/sizeof(supp_funcs[0])); index++)
     {
-        if (!strcmp(supp_funcs[index].func_name, argv[1]))
+        if (!test_strcmp(supp_funcs[index].func_name, argv[1]))
         {
             lm_func_validator = &supp_funcs[index];
             break;
@@ -2258,6 +2623,14 @@ int main(int argc, char **argv)
     if (argv[5] != NULL)
         al_check = atoi(argv[5]); //Check for alignment validation test.
 
+#ifdef LIBMEM_VALIDATOR_DEBUG
+    printf("[DEBUG] libmem_validator started\n");
+    printf("[DEBUG] VEC_SZ = %d bytes\n", VEC_SZ);
+    printf("[DEBUG] Function: %s\n", lm_func_validator->func_name);
+    printf("[DEBUG] Size: %lu\n", size);
+    printf("[DEBUG] Alignment check mode: %s\n", al_check ? "All alignments" : "Single test");
+#endif
+
     if (al_check == 0)
     {
         lm_func_validator->func(size, dst_alignment, src_alignment);
@@ -2269,6 +2642,9 @@ int main(int argc, char **argv)
         {
             for(unsigned int aln_dst = 0; aln_dst < VEC_SZ; aln_dst++)
             {
+#ifdef LIBMEM_VALIDATOR_DEBUG
+                printf("[DEBUG] Testing alignment - src: %d, dst: %d\n", aln_src, aln_dst);
+#endif
                 lm_func_validator->func(size, aln_dst, aln_src);
             }
         }

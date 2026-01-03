@@ -72,17 +72,27 @@ build_dir/test/out/<libmem_function>/<time-stamp-counter>/
                           tbm          TinyMembench
                           fbm          Fleetbench
 
-      <common_options>  = -x<core_id> -r [start] [end] -t "<iterator_value>" <LibMem_function>
+      <common_options>  = -x<core_id> -r [start] [end] -t "<iterator_value>" <LibMem_function> -perf [p,g,b,d] -bestperf
 
                         -x <core_id> : Enter the CPU core on which you want to run the benchmark.
                         -r [start] [end] : start and end size range in Bytes.(Not applicable for Fleetbench)
+                                           Format: NUMBER[UNIT]
+                                           where UNIT can be B, KB, MB, or GB(case insensitive).
+                                           The default unit is Bytes.
                         -t "iter_value"  : increments the start size by "iter_value".
                                            (0 stands for size<<1; other +ve integers stands for incremental iterations.)
                         LibMem_function  : mem and str functions
-                                          (memcpy,memmove,memset,memcmp,memchr,
+                                          (memcpy,memmove,memset,memcmp,memchr,mempcpy
                                           strcpy,strncpy,strcmp,strncmp,strlen,strcat,strncat,strspn,strstr,strchr)
+                        -perf            : Performance report type
+                                          l - Performance analysis for LibMem
+                                          g - Performance analysis for Glibc
+                                          c - Comparison report between LibMem old and new
+                                          d - Defalut report Glibc vs. LibMem
+                        -bestperf        : Runs benchmark 3 times and selects the best throughput
+                                          for each size from those iterations (specific to GBM and TBM)
 
-      <GBM_specific_option> = -m <mode> -a <align> -s <cache_spill> -p <page_option> -preload <y,n> -i<repetitions> -w<warm_up time>
+      <GBM_specific_option> = -m <mode> -a <align> -s <cache_spill> -p <page_option> -o <overlap> -preload <y,n> -i<repetitions> -w<warm_up time>
 
                             -m <c, u>    : cached  & uncached behaviour
                             -a <a, u, d> : aligned (src and dst alignment are equal)
@@ -90,6 +100,8 @@ build_dir/test/out/<libmem_function>/<time-stamp-counter>/
                                            default alignment is random.
                             -s <l, m>    : Less spill and more spill (applicable with align mode only)
                             -p <x, t>    : Page-cross and Page-Tail scenario
+                            -o <f, b, d> : [Memmove only]Forward overlap, Backward overlap and Default overlap
+                                          (Default is 'd',both forward and backward overlaps)
                           -preload <y,n> : Running with LD_PRELOAD option = y & Running with static binaries = n
                           -i<repetitions>: Number of repetitions for consistent performance runs
                         -w<warm_up time> : Minimum Warmup time in seconds.
@@ -106,14 +118,14 @@ build_dir/test/out/<libmem_function>/<time-stamp-counter>/
     $ ./bench.py -h
 
     Running Google Benchmark
-    $ ./bench.py gbm memcpy -r 8 16 -m u -t "1" -x 16
+    $ ./bench.py gbm memcpy -r 8B 16B -m u -t "1" -x 16
     Runs the Google Benchmark for Un-Cached Mode Memcpy for sizes[8,9,..16] on core -16
 
-    $ ./bench.py gbm memcpy -r 8 32768 -s m -x 16
+    $ ./bench.py gbm memcpy -r 8B 32KB -s m -x 16
     Runs GBM for Cached memcpy with More-cache spill
 
     Running TinyMembench
-    $ ./bench.py tbm strcpy -r 8 4096 -x 47
+    $ ./bench.py tbm strcpy -r 8B 4KB -x 47
     Runs tinymembench for strcpy function fro sizes [8, 16, 32,..4096B] on core - 47
 
     Running Fleetbench

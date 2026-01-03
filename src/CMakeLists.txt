@@ -29,6 +29,7 @@ check_c_compiler_flag("-march=znver3"    CONFIG_COMPILER_HAS_ZEN3)
 check_c_compiler_flag("-march=znver4"    CONFIG_COMPILER_HAS_ZEN4)
 check_c_compiler_flag("-march=znver5"    CONFIG_COMPILER_HAS_ZEN5)
 
+
 set(DETECT_ARCH 1)
 set(ARCH_UNDF 255)
 set(MIN_ZEN_VER 1)
@@ -107,13 +108,23 @@ set(_CC_Warning_Flags -Wall -Wextra -Werror -Wunused-macros -Wundef)
 # Compiler Exempted Warning flags
 set(_CC_Exempted_Warning_Flags -Wno-unused-function)
 # Compiler Optimization flags
-set(_CC_Optimization_Flags -O3 -mcmodel=small)
+set(_CC_Optimization_Flags -O3 -mcmodel=small -flto=auto)
 # Compiler Code Generation flags
 set(_CC_Code_Gen_Flags -fno-common)
-# Compiler Shared binary exclusive flags
-set(_CC_Shared_Flags -flto -fvisibility=hidden)
+# Code block alignment flags
+set(_CC_Code_Alignment_Flags -falign-loops=64 -falign-functions=64)
+# Label and Jump alignment compiler options are not supported in Clang
+if (NOT ${CMAKE_C_COMPILER_ID}  STREQUAL "Clang")
+    list(APPEND _CC_Code_Alignment_Flags -falign-labels=64 -falign-jumps=64:16:8)
+endif ()
+# Linker flag for IFUNC symbol binding support
+set(_CC_Shared_Flags -Wl,-Bsymbolic)
 
-set(_CC_Flags ${_CC_Warning_Flags} ${_CC_Exempted_Warning_Flags} ${_CC_Optimization_Flags} ${_CC_Code_Gen_Flags})
+set(_CC_Flags ${_CC_Warning_Flags} ${_CC_Exempted_Warning_Flags} ${_CC_Optimization_Flags} ${_CC_Code_Gen_Flags} ${_CC_Code_Alignment_Flags})
+
+if(ALMEM_GCOV)
+  list(APPEND _CC_Flags -fprofile-arcs -ftest-coverage)
+endif()
 
 add_compile_options(${_CC_Flags})
 
@@ -122,13 +133,8 @@ if ((${CMAKE_C_COMPILER_ID}  STREQUAL "Clang") AND ALMEM_TUNABLES)
     add_definitions(-DALMEM_CMPSD_CLANG_WORKAROUND)
 endif ()
 
-if(ALMEM_GCOV AND ALMEM_LOGGING)
-  target_compile_options(${PROJECT_NAME} PUBLIC -fprofile-arcs  -ftest-coverage)
-  target_link_options(${PROJECT_NAME} PUBLIC -fprofile-arcs  -ftest-coverage)
-endif()
-
 # Add source files
-set(SOURCE_FILES cache_info.c cpu_features.c threshold.c libmem.c)
+set(SOURCE_FILES libmem.c)
 
 # Memory Functions
 set(SUPP_MEM_FUNCS memcpy mempcpy memmove memset memcmp memchr)

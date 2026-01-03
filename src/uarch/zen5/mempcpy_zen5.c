@@ -23,16 +23,19 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "../../isa/avx512/optimized/mempcpy_avx512_erms.c"
+#include "logger.h"
+#include "../../isa/avx512/optimized/memcpy_impl_avx512.c"
 
-void * __attribute__((flatten)) __mempcpy_zen5(void *  __restrict dst,
+HIDDEN_SYMBOL void * __attribute__((flatten)) __mempcpy_zen5(void *  __restrict dst,
                              const void *  __restrict src, size_t size)
 {
     LOG_INFO("\n");
-    return _mempcpy_avx512_erms(dst, src, size);
+    void *ret = dst + size;
+    _memcpy_avx512_erms(dst, src, size);
+    return ret;
 }
 
 #ifndef ALMEM_DYN_DISPATCH
 void *mempcpy(void *, const void *, size_t) __attribute__((weak,
-                        alias("__mempcpy_zen5"), visibility("default")));
+                        alias("__mempcpy_zen5")));
 #endif

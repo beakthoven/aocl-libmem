@@ -1,4 +1,4 @@
-/* Copyright (C) 2024 Advanced Micro Devices, Inc. All rights reserved.
+/* Copyright (C) 2024-25 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
@@ -23,9 +23,10 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "./optimized/memcpy_avx512.c"
+#include "logger.h"
+#include "./optimized/memcpy_impl_avx512.c"
 
-void * __attribute__((flatten)) __memcpy_avx512(void * __restrict dst,
+HIDDEN_SYMBOL void * __attribute__((flatten)) __memcpy_avx512(void * __restrict dst,
                   const void * __restrict src, size_t size)
 {
     LOG_INFO("\n");
@@ -33,4 +34,4 @@ void * __attribute__((flatten)) __memcpy_avx512(void * __restrict dst,
 }
 
 void *memcpy(void *, const void *, size_t) __attribute__((weak,
-                        alias("__memcpy_avx512"), visibility("default")));
+                        alias("__memcpy_avx512")));

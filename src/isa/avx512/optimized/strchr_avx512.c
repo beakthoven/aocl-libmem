@@ -25,11 +25,12 @@
 #include <stddef.h>
 #include "logger.h"
 #include <immintrin.h>
-#include "alm_defs.h"
+#include "almem_defs.h"
 #include <zen_cpu_info.h>
 
 /* This function is an optimized version of strchr using AVX-512 instructions.
 It finds and returns a pointer to the first occurrence of the character in the string. */
+
 
 static inline char* __attribute__((flatten)) _strchr_avx512(const char *str, int c)
 {
@@ -53,8 +54,8 @@ static inline char* __attribute__((flatten)) _strchr_avx512(const char *str, int
     {
         z7 = _mm512_set1_epi8(0xff);
         //Mask to load only the valid bytes from the string without crossing the page boundary
-        mask = ((uint64_t)-1) >> offset;
-        z1 = _mm512_mask_loadu_epi8(z7 ,mask, str);
+        mask = _bzhi_u64((uint64_t)-1, ZMM_SZ - offset);
+        z1 = _mm512_mask_loadu_epi8(z7, mask, str);
     }
     // Load first 64 bytes from `str` into z1
     else
@@ -78,6 +79,7 @@ static inline char* __attribute__((flatten)) _strchr_avx512(const char *str, int
     uint8_t cnt_vec = 7;
     while (cnt_vec--)
     {
+        _mm_prefetch(str + offset + ZMM_SZ, _MM_HINT_NTA);
         z1 = _mm512_load_si512(str + offset);
         zxor = _mm512_xor_si512(z1, zch);
         zmin = _mm512_min_epu8(zxor, z1);
@@ -95,21 +97,17 @@ static inline char* __attribute__((flatten)) _strchr_avx512(const char *str, int
 
     // Ensure the next 4 * 64B vector loads in the main loop
     // do not cross a page boundary to prevent potential seg faults.
-    uint8_t vec_4_offset = (((uintptr_t)str + offset) & (4 * ZMM_SZ - 1) >> 6);
-    if (vec_4_offset)
-    {
-        do
+    cnt_vec = 4 - ((((uintptr_t)str + offset) & (4 * ZMM_SZ - 1)) >> 6);
+    while (cnt_vec--) {
+        z1 = _mm512_load_si512(str + offset);
+        ret = _mm512_cmpeq_epu8_mask(_mm512_min_epu8(_mm512_xor_si512(z1, zch),z1), z0);
+        if (ret)
         {
-            z1 = _mm512_load_si512(str + offset);
-            ret = _mm512_cmpeq_epu8_mask(_mm512_min_epu8(_mm512_xor_si512(z1, zch),z1), z0);
-            if (ret)
-            {
-                if(*((char*)str + _tzcnt_u64(ret) + offset) == ch )
-                    return (char*)str + _tzcnt_u64(ret) + offset;
-                return NULL;
-            }
-            offset += ZMM_SZ;
-        } while (vec_4_offset++ < 4);
+            if(*((char*)str + _tzcnt_u64(ret) + offset) == ch )
+                return (char*)str + _tzcnt_u64(ret) + offset;
+            return NULL;
+        }
+        offset += ZMM_SZ;
     }
 
     // Main loop to process 4 vectors at a time for larger sizes(> 512B)

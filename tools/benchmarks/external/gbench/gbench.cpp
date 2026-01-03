@@ -32,6 +32,7 @@
 #include <immintrin.h>
 #include <math.h>
 #include <algorithm>
+#include <new> //for std::align_val_t
 
 #define MIN_PRINTABLE_ASCII     32
 #define MAX_PRINTABLE_ASCII     127
@@ -48,9 +49,47 @@
 #define CACHELINE_MULTIPLE      6
 #define BUFFER                  1
 #define CONCAT_BUFFER           2
+#define OVERLAP_BUFFER          3
+#define CACHE_LINE_SZ           64
 
 #define CLFLUSHOPT(addr, cacheline_iters) \
     _mm_clflushopt((void *)((uintptr_t)(addr) + (cacheline_iters) * CL_SIZE))
+
+//Function to allocate aligned memory for src and dst buffers with error handling
+//alignement: alignment values are (CL_SZIE, PAGE_SIZE)
+//allocSize: The size for the 'src' allocation
+//buffMultiplier: The multiplier for the 'dst' allocation (buffMultipler * allocSize)
+//srcPtrVar: The variable (e.g., 'src') to store the allocated source pointer
+//dstPtrVar: The variable (e.g., 'dst') to store the allocated destination pointer
+
+void allocateAlignedBuffers(size_t alignment, size_t allocSize, size_t buffMultiplier, char*& srcPtrVar, char*& dstPtrVar) {
+    // Initialize pointers to nullptr for safe cleanup in case of partial allocation failure
+    srcPtrVar = nullptr;
+    dstPtrVar = nullptr;
+
+    try {
+        std::align_val_t currentAlignmentVal = static_cast<std::align_val_t>(alignment);
+
+        // Allocate memory for the source buffer with specified alignment
+        srcPtrVar = static_cast<char*>(operator new(allocSize, currentAlignmentVal));
+
+        // Allocate memory for the destination buffer with specified alignment
+        dstPtrVar = static_cast<char*>(operator new(buffMultiplier * allocSize, currentAlignmentVal));
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "Memory allocation failed: " << e.what() << std::endl;
+
+        // Clean up any memory that was successfully allocated before the exception
+        if (srcPtrVar) {
+            operator delete(srcPtrVar, static_cast<std::align_val_t>(alignment));
+        }
+
+        if (dstPtrVar) {
+            operator delete(dstPtrVar, static_cast<std::align_val_t>(alignment));
+        }
+
+        exit(EXIT_FAILURE); // Terminate
+    }
+}
 
 enum MemoryMode {
     CACHED,
@@ -125,7 +164,6 @@ public:
         size_t adj_size = size;
         unsigned int src_offset, dst_offset, adj_offset = 0, page_offset = 0;
         uint32_t src_alnmnt, dst_alnmnt, alnmnt = 0;
-
         switch(page)
         {
             case 'x': //Page_cross
@@ -136,18 +174,7 @@ public:
                     adj_size = page_size + size;
                     adj_offset = page_size - page_offset;
 
-                    if (posix_memalign((void**)&src, page_size, adj_size) != 0)
-                    {
-                        std::cout<<"SRC Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
-
-                    if (posix_memalign((void**)&dst, page_size, buff * adj_size) != 0)
-                    {
-                        free(src);
-                        std::cout<<"DST Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
+                    allocateAlignedBuffers(page_size, adj_size, buff, src, dst);
 
                     src_alnd = src + adj_offset;
                     dst_alnd = dst + adj_offset;
@@ -160,19 +187,7 @@ public:
                         page_offset = page_size - (size + 1);
 
                     adj_offset = page_offset;
-
-                    if (posix_memalign((void**)&src, page_size, adj_size) != 0)
-                    {
-                        std::cout<<"SRC Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
-
-                    if (posix_memalign((void**)&dst, page_size, buff * adj_size) != 0)
-                    {
-                        free(src);
-                        std::cout<<"DST Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
+                    allocateAlignedBuffers(page_size, adj_size, buff, src, dst);
                     src_alnd = src + adj_offset;
                     dst_alnd = dst + adj_offset;
                     break;
@@ -185,19 +200,7 @@ public:
                         adj_size = size + CL_SIZE;
                         alnmnt = (rand() % CL_SPILL_OFFSET) + 1;
                     }
-                    if (posix_memalign((void**)&src, page_size, adj_size) != 0)
-                    {
-                        std::cout<<"SRC Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
-
-                    if (posix_memalign((void**)&dst, page_size, buff * adj_size) != 0)
-                    {
-                        free(src);
-                        std::cout<<"DST Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
-
+                    allocateAlignedBuffers(page_size, adj_size, buff, src, dst);
                     if (spill == 'm')
                         aln_adj = CL_SIZE - alnmnt;
 
@@ -210,18 +213,7 @@ public:
 
             case 'u': //Unaligned allocation
                     adj_size = size + CL_SIZE;
-                    if (posix_memalign((void**)&src, page_size, adj_size) != 0)
-                    {
-                        std::cout<<"SRC Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
-
-                    if (posix_memalign((void**)&dst, page_size, buff * adj_size) != 0)
-                    {
-                        free(src);
-                        std::cout<<"DST Memory allocation failed."<<std::endl;
-                        exit(-1);
-                    }
+                    allocateAlignedBuffers(page_size, adj_size, buff, src, dst);
 
                     src_alnmnt = (rand() % CL_SPILL_OFFSET) + 1;
 
@@ -244,21 +236,13 @@ public:
                     }
                     break;
 
-            default: //Random allocation
-                        src = new char[size];
-                        dst = new char[buff * size];
+            default: //Default allocation
+                        allocateAlignedBuffers(CL_SIZE, size, buff, src, dst);
                         src_alnd = src;
                         dst_alnd = dst;
+
         }
 
-        //chck for buffer allocation
-        if (src == nullptr || dst == nullptr)
-        {
-            free(src);
-            free(dst);
-            std::cerr<< "Memory Allocation Failed!\n";
-            exit(-1);
-        }
         if (isStringOperation)
         {
             memset(src_alnd, 'x', size);
@@ -272,9 +256,16 @@ public:
         }
     }
 
-    void TearDown() {
-        delete[] src;
-        delete[] dst;
+    void TearDown(char alignment) {
+        std::align_val_t alignment_del;
+        if (alignment =='d')
+            alignment_del = static_cast<std::align_val_t>(CL_SIZE);
+        else
+            alignment_del = static_cast<std::align_val_t>(sysconf(_SC_PAGESIZE));
+
+        operator delete(src, alignment_del);
+        operator delete(dst, alignment_del);
+
     }
 
     template <typename MemFunction, typename... Args>
@@ -303,7 +294,7 @@ public:
                 benchmark::DoNotOptimize(func((char*)dst_alnd, (char*)src_alnd, size));
             }
         }
-        TearDown();
+        TearDown(alignment);
 
         Bench_Result(state);
     }
@@ -331,9 +322,11 @@ public:
                 benchmark::DoNotOptimize(func(src_alnd, 'x', size));
             }
         }
-        TearDown();
+        TearDown(alignment);
         Bench_Result(state);
-    }void string_setup(std::string& accept, int size, std::string& s)
+    }
+
+    void string_setup(std::string& accept, int size, std::string& s)
     {
         size_t accept_len = ceil(sqrt(size));
         accept = generate_random_string(accept_len);
@@ -356,7 +349,6 @@ public:
         }
         return random_string;
     }
-
 
     template <typename MemFunction, typename... Args>
     void strRunBenchmark(benchmark::State& state, MemoryMode mode, char alignment, char spill, char page, MemFunction func, const char* name, Args... args) {
@@ -438,10 +430,9 @@ public:
                 }
             }
         }
-        TearDown();
+        TearDown(alignment);
     Bench_Result(state);
     }
-
 
     template <typename MemFunction, typename... Args>
     void strlenRunBenchmark(benchmark::State& state, MemoryMode mode,char alignment, char spill, char page, MemFunction func, const char* name, Args... args) {
@@ -466,7 +457,7 @@ public:
                 benchmark::DoNotOptimize(func((char*)src_alnd));
             }
         }
-        TearDown();
+        TearDown(alignment);
     Bench_Result(state);
     }
 
@@ -510,7 +501,7 @@ public:
                 benchmark::DoNotOptimize(strstr(haystack_nomatch.c_str(), needle.c_str()));
                 benchmark::DoNotOptimize(strstr(haystack_avg.c_str(), needle.c_str()));
             }
-            TearDown();
+            TearDown(alignment);
         }
         else
         {
@@ -550,11 +541,11 @@ public:
 
                 benchmark::DoNotOptimize(strstr(haystack.c_str(), needle.c_str()));
                 state.PauseTiming();
-                TearDown();
+                TearDown(alignment);
                 state.ResumeTiming();
             }
         }
-    Bench_Result(state);
+        Bench_Result(state);
     }
 
     template <typename MemFunction, typename... Args>
@@ -600,9 +591,10 @@ public:
                 benchmark::DoNotOptimize(func((char*)dst_alnd, (char*)src_alnd, size));
             }
         }
-        TearDown();
+        TearDown(alignment);
         Bench_Result(state);
     }
+
     template <typename MemFunction, typename... Args>
     void strchrRunBenchmark(benchmark::State& state, MemoryMode mode, char alignment, char spill, char page, MemFunction func, const char* name, Args... args) {
         int size = state.range(0);
@@ -627,7 +619,63 @@ public:
                 benchmark::DoNotOptimize(func((char*)src_alnd,'X'));
             }
         }
-        TearDown();
+        TearDown(alignment);
+    Bench_Result(state);
+    }
+
+    template <typename MemFunction, typename... Args>
+    void memOverlapBenchmark(benchmark::State& state, MemoryMode mode, char alignment, char spill, char page, MemFunction func, const char* name, char overlap_type, Args... args) {
+        int size = state.range(0);
+        SetUp(size, alignment, spill, page, false, OVERLAP_BUFFER);
+
+        char* dst_ptr = (char*)dst_alnd + rand()% size + 1;
+        char* src_ptr = (char*)dst_ptr + rand()% size + 1;
+        if(mode == CACHED)
+        {
+            if (overlap_type == 'f')
+            {
+                for (auto _ : state) {
+                    //Forward Overlap: dst < src
+                    benchmark::DoNotOptimize(func(dst_ptr, src_ptr, size));
+                }
+            }
+            else if (overlap_type == 'b')
+            {
+                for (auto _ : state) {
+                    //Backward Overlap: dst > src
+                    benchmark::DoNotOptimize(func(src_ptr, dst_ptr, size));
+                }
+            }
+            else
+            {
+                //Both Forward and Backward overlap
+                for (auto _ : state) {
+                    benchmark::DoNotOptimize(func(dst_ptr, src_ptr, size));
+                    benchmark::DoNotOptimize(func(src_ptr, dst_ptr, size));
+                }
+            }
+        }
+
+        else {
+            for (auto _ : state) {
+                state.PauseTiming();
+                uint32_t cacheline_iters = OVERLAP_BUFFER * size >> CACHELINE_MULTIPLE;
+                do {
+                    CLFLUSHOPT(dst_alnd, cacheline_iters);
+                } while (cacheline_iters--);
+                state.ResumeTiming();
+                if (overlap_type == 'f')
+                    benchmark::DoNotOptimize(func(dst_ptr, src_ptr, size));
+                else if (overlap_type == 'b')
+                    benchmark::DoNotOptimize(func(src_ptr, dst_ptr, size));
+                else
+                {
+                    benchmark::DoNotOptimize(func(dst_ptr, src_ptr, size));
+                    benchmark::DoNotOptimize(func(src_ptr, dst_ptr, size));
+                }
+            }
+        }
+        TearDown(alignment);
     Bench_Result(state);
     }
 
@@ -679,6 +727,12 @@ void runMiscStringBenchmark(benchmark::State& state, MemoryMode mode, char align
     fixture.strchrRunBenchmark(state, mode, alignment, spill, page, func, name, args...);
 }
 
+template <typename MemFunction, typename... Args>
+void runMemoryOverlapBenchmark(benchmark::State& state, MemoryMode mode, char alignment, char spill, char page, MemFunction func, const char* name, char overlap_type, Args... args) {
+    MemoryFixture fixture;
+    fixture.memOverlapBenchmark(state, mode, alignment, spill, page, func, name, overlap_type, args...);
+}
+
 MemData functionList[] = {
     REGISTER_MEM_FUNCTION(memcpy),
     REGISTER_MEM_FUNCTION(mempcpy),
@@ -725,13 +779,14 @@ enum class Parameters
     iterations,         // argv[5]
     align,              // argv[6]
     cache_spill,        // argv[7]
-    page                // argv[8]
+    page,               // argv[8]
+    overlap             // argv[9]
 };
 
 int main(int argc, char** argv) {
     ::benchmark::Initialize(&argc, argv);
     srand(time(NULL));
-    char mode='c', alignment = 'd', spill = 'l', page = 'n';
+    char mode='c', alignment = 'd', spill = 'l', page = 'n', overlap = 'd';
     unsigned int size_start, size_end, iter = 0;
     std::string func;
 
@@ -755,16 +810,17 @@ int main(int argc, char** argv) {
         spill= *argv[static_cast<int>(Parameters::cache_spill)];
 
     if(argv[static_cast<int>(Parameters::page)]!=NULL)
-        spill= *argv[static_cast<int>(Parameters::page)];
+        page= *argv[static_cast<int>(Parameters::page)];
+
+    if(argv[static_cast<int>(Parameters::overlap)]!=NULL)
+        overlap= *argv[static_cast<int>(Parameters::overlap)];
 
     std::cout<<"FUNCTION: "<<func<<" MODE: "<<mode<<std::endl;
     std::cout<<"SIZE: "<<size_start<<" "<<size_end<<std::endl;
 
-    MemoryMode operation;
-    if( mode == 'u')
-        operation = UNCACHED;
-    else
-        operation = CACHED;
+    //Determine the memory mode
+    MemoryMode operation = (mode == 'u') ? UNCACHED : CACHED;
+    std::string _Mode = (operation == UNCACHED) ? "_UNCACHED" : "_CACHED";
 
     auto memoryBenchmark = [&](benchmark::State& state) {
         for (const auto &MemData : functionList) {
@@ -821,62 +877,44 @@ int main(int argc, char** argv) {
             }
         }
     };
-    //Register Benchmark
-    std::string _Mode;
-    if(operation == UNCACHED)
-        _Mode="_UNCACHED";
-    else
-        _Mode="_CACHED";
 
-    if(iter == 0)
-    {
-
-        if (func.compare(0, 3, "mem") == 0)
-        {
-            if(func.compare(0, 4, "mems")== 0 || func.compare(0, 5, "memch")== 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), Misc_memoryBenchmark)->RangeMultiplier(2)->Range(size_start, size_end);
-            else
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), memoryBenchmark)->RangeMultiplier(2)->Range(size_start, size_end);
+    auto memoryOverlapBenchmark = [&](benchmark::State& state) {
+        for (const auto &MemData : functionList) {
+            if (func == MemData.functionName && func == "memmove") {
+                char actual_overlap = overlap;
+                runMemoryOverlapBenchmark(state, operation, alignment, spill, page, MemData.functionPtr, MemData.functionName, actual_overlap);
+            }
         }
-        else if(func.compare(0, 3, "str") == 0)
-        {
-            if(func.compare(0, 4, "strn") == 0 )
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), string_n_Benchmark)->RangeMultiplier(2)->Range(size_start, size_end);
-            else if(func.compare(0, 4, "strl") == 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), strlenBenchmark)->RangeMultiplier(2)->Range(size_start, size_end);
-            else if(func.compare(0, 6, "strstr") == 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), substrBenchmark)->RangeMultiplier(2)->Range(size_start, size_end);
-            else if(func.compare(0, 6, "strchr") == 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), misc_string_Benchmark)->RangeMultiplier(2)->Range(size_start, size_end);
-            else
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), stringBenchmark)->RangeMultiplier(2)->Range(size_start, size_end);
-        }
-    }
-    //Iterative Benchmark
-    else
-    {
-        if (func.compare(0, 3, "mem") == 0)
-        {
-            if(func.compare(0, 4, "mems")== 0 || func.compare(0, 5, "memch")== 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), Misc_memoryBenchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
-            else
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), memoryBenchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
+    };
 
-        }
-        else if(func.compare(0, 3, "str") == 0)
-        {
-            if(func.compare(0, 4, "strn") == 0 )
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), string_n_Benchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
-            else if(func.compare(0, 4, "strl") == 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), strlenBenchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
-            else if(func.compare(0, 6, "strstr") == 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), substrBenchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
-            else if(func.compare(0, 6, "strchr") == 0)
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), misc_string_Benchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
-            else
-                benchmark::RegisterBenchmark((func + _Mode).c_str(), stringBenchmark)->RangeMultiplier(2)->DenseRange(size_start, size_end, iter);
+    //Register benchmark
+    auto registerBenchmark = [&](auto benchmarkFunction, const std::string& suffix = "") {
+        std::string benchName = func + suffix + _Mode;
+        auto benchmark = benchmark::RegisterBenchmark(benchName.c_str(), benchmarkFunction)->RangeMultiplier(2);
+        return (iter == 0) ? benchmark->Range(size_start, size_end) : benchmark->DenseRange(size_start, size_end, iter);
+    };
 
+     if (func.compare(0, 3, "mem") == 0) {
+        if (func.compare(0, 4, "mems") == 0 || func.compare(0, 5, "memch") == 0) {
+            registerBenchmark(Misc_memoryBenchmark);
+        } else if (func == "memmove") {
+            registerBenchmark(memoryOverlapBenchmark, "_overlap");
+        } else {
+            registerBenchmark(memoryBenchmark);
+        }
+    } else if (func.compare(0, 3, "str") == 0) {
+        if (func.compare(0, 4, "strn") == 0) {
+            registerBenchmark(string_n_Benchmark);
+        } else if (func.compare(0, 4, "strl") == 0) {
+            registerBenchmark(strlenBenchmark);
+        } else if (func.compare(0, 6, "strstr") == 0) {
+            registerBenchmark(substrBenchmark);
+        } else if (func.compare(0, 6, "strchr") == 0) {
+            registerBenchmark(misc_string_Benchmark);
+        } else {
+            registerBenchmark(stringBenchmark);
         }
     }
+
     ::benchmark::RunSpecifiedBenchmarks();
 }

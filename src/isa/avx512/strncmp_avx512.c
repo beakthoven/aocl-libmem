@@ -1,4 +1,4 @@
-/* Copyright (C) 2024 Advanced Micro Devices, Inc. All rights reserved.
+/* Copyright (C) 2024-25 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
@@ -22,11 +22,20 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#include "./optimized/strncmp_avx512.c"
-int __attribute__((flatten)) __strncmp_avx512(const char *str1, const char *str2, size_t size)
+#ifndef STRNCMP
+#define STRNCMP
+#endif
+
+#include "./optimized/strcmp_avx512.c"
+
+#ifdef STRNCMP
+#undef STRNCMP
+#endif
+
+HIDDEN_SYMBOL int __attribute__((flatten)) __strncmp_avx512(const char *str1, const char *str2, size_t size)
 {
     LOG_INFO("\n");
     return _strncmp_avx512(str1, str2, size);
 }
 int strncmp(const char *, const char *, size_t) __attribute__((weak,
-                        alias("__strncmp_avx512"), visibility("default")));
+                        alias("__strncmp_avx512")));
